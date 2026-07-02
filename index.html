@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#000010" />
+  <title>Mandelbrot Deep Zoom</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000010'/%3E%3Ccircle cx='6' cy='8' r='3' fill='%23ffaa00'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <canvas id="view" aria-label="Mandelbrot view"></canvas>
+
+  <div id="hud" class="hud">
+    <div class="hud-row">
+      <div id="status" class="status" data-testid="status">starting…</div>
+      <div id="zoom" class="zoom" data-testid="zoom">2^0.0</div>
+    </div>
+    <div id="coords" class="coords-hud" data-testid="coords"></div>
+  </div>
+
+  <div class="corner" aria-hidden="false">
+    <button id="help" class="corner-btn" aria-label="How to navigate" title="How to navigate (?)">?</button>
+    <button id="fullscreen" class="corner-btn" aria-label="Toggle fullscreen" title="Fullscreen (f)">⛶</button>
+  </div>
+
+  <!-- First-run gesture hint. pointer-events:none (see styles.css) so it NEVER blocks a
+       tap/drag/scroll — the same first interaction that dismisses it also acts (zoom/pan),
+       which is exactly what the hint promises. Re-openable any time via the “?” button. -->
+  <div id="hint" class="hint" data-testid="hint" role="dialog" aria-label="How to navigate">
+    <div class="hint-card">
+      <h2>Explore the Mandelbrot set</h2>
+      <ul class="hint-gestures">
+        <li><b>Tap</b> — zoom in <span class="dim">(Shift- or right-tap zooms out)</span></li>
+        <li><b>Drag</b> — pan around</li>
+        <li><b>Pinch</b> — zoom <span class="dim">(touch)</span></li>
+        <li><b>Scroll / +&nbsp;−</b> — zoom · <b>Arrow keys</b> — pan <span class="dim">(desktop)</span></li>
+        <li><b>☰ Menu</b> — palettes, coordinates, deep-zoom presets</li>
+      </ul>
+      <div class="hint-foot">tap anywhere to begin</div>
+    </div>
+  </div>
+
+  <button id="panelToggle" class="panel-toggle" aria-label="Toggle controls">☰</button>
+
+  <section id="panel" class="panel" data-testid="panel" aria-label="Controls">
+    <header class="panel-head">
+      <h1>Mandelbrot · deep zoom</h1>
+      <button id="panelClose" class="icon-btn" aria-label="Close">×</button>
+    </header>
+
+    <div class="row">
+      <button id="zoomIn" class="btn" data-testid="zoomIn">Zoom +</button>
+      <button id="zoomOut" class="btn" data-testid="zoomOut">Zoom −</button>
+      <button id="reset" class="btn" data-testid="reset">Reset</button>
+    </div>
+
+    <label class="field">
+      <span>Iterations</span>
+      <div class="iter-row">
+        <input id="iter" type="range" min="100" max="200000" step="100" data-testid="iter" />
+        <input id="iterNum" type="number" min="1" max="2000000" step="100" inputmode="numeric"
+               aria-label="Iteration count" data-testid="iterNum" />
+      </div>
+    </label>
+    <label class="check">
+      <input id="autoIter" type="checkbox" checked data-testid="autoIter" />
+      <span>Auto iterations (scale with depth)</span>
+    </label>
+    <label class="check">
+      <input id="useGpu" type="checkbox" checked data-testid="useGpu" />
+      <span>GPU acceleration (WebGL shaders)</span>
+    </label>
+    <label class="check">
+      <input id="showGlitch" type="checkbox" data-testid="showGlitch" />
+      <span>Glitch overlay (debug · tints suspect pixels)</span>
+    </label>
+
+    <label class="field">
+      <span>Supersampling (anti-alias)</span>
+      <select id="ss" data-testid="ss">
+        <option value="1">Off (1×)</option>
+        <option value="2" selected>2× (4 samples)</option>
+        <option value="3">3× (9 samples)</option>
+        <option value="4">4× (16 samples)</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Resolution (render pixels)</span>
+      <select id="resScale" data-testid="resScale">
+        <option value="1" selected>Full (screen resolution)</option>
+        <option value="2">Half (faster)</option>
+        <option value="3">Third (fastest)</option>
+      </select>
+    </label>
+    <label class="check">
+      <input id="forceHQ" type="checkbox" data-testid="forceHQ" />
+      <span>Force high quality (full AA at extreme depth · slower)</span>
+    </label>
+    <label class="check">
+      <input id="lowPower" type="checkbox" data-testid="lowPower" />
+      <span>Low power (battery saver · lower res / iterations / AA)</span>
+    </label>
+    <label class="check">
+      <input id="series" type="checkbox" checked data-testid="series" />
+      <span>Series approximation (CPU · skips early iterations · faster deep zoom)</span>
+    </label>
+
+    <label class="field">
+      <span>Palette</span>
+      <select id="palette" data-testid="palette">
+        <option value="ultra">Ultra</option>
+        <option value="fire">Fire</option>
+        <option value="rainbow">Rainbow</option>
+        <option value="gray">Gray</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Color cycle <em id="cycleVal"></em></span>
+      <input id="cycle" type="range" min="4" max="256" step="1" value="48" data-testid="cycle" />
+    </label>
+    <label class="field">
+      <span>Color shift</span>
+      <input id="shift" type="range" min="0" max="1" step="0.01" value="0" data-testid="shift" />
+    </label>
+
+    <fieldset class="coords">
+      <legend>Coordinates (high precision)</legend>
+      <label>Re <textarea id="reIn" rows="2" spellcheck="false" data-testid="reIn"></textarea></label>
+      <label>Im <textarea id="imIn" rows="2" spellcheck="false" data-testid="imIn"></textarea></label>
+      <label>Radius <input id="radIn" type="text" spellcheck="false" data-testid="radIn" /></label>
+      <div class="row">
+        <button id="goto" class="btn" data-testid="goto">Go</button>
+        <button id="copyLink" class="btn" data-testid="copyLink">Copy link</button>
+        <button id="save" class="btn" data-testid="save">Save PNG</button>
+      </div>
+    </fieldset>
+
+    <div class="row places">
+      <button class="btn place" data-cx="-0.5" data-cy="0" data-r="1.5">Home</button>
+      <button class="btn place" data-cx="-0.743643887037158704752191506114774" data-cy="0.131825904205311970493132056385139" data-r="5e-13">Seahorse</button>
+      <button class="btn place" data-cx="-0.7436438870371587" data-cy="0.13182590420531197" data-r="1e-7">Spiral</button>
+      <button class="btn place" data-cx="-1.749999999999999" data-cy="0" data-r="1e-12">Antenna</button>
+    </div>
+
+    <details class="about">
+      <summary>About / debug</summary>
+      <div id="debug" class="debug" data-testid="debug"></div>
+      <p class="tiny">Perturbation theory + Zhuoran rebasing. Rendered on the GPU
+      via WebGL shaders (naive float32 when shallow; double-single "df64"
+      perturbation, reference orbit as a texture, when deep), validated against the
+      CPU/BigInt oracle. The CPU worker engines remain the fallback for the deepest
+      zooms (&gt;2^112) and the ground truth (validated to 2^400).</p>
+    </details>
+  </section>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

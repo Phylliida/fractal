@@ -1,0 +1,147 @@
+:root {
+  --bg: #000010;
+  --panel: rgba(10, 14, 28, 0.94);
+  --fg: #e8ecf8;
+  --muted: #9aa3c0;
+  --accent: #4f8cff;
+  --border: rgba(255, 255, 255, 0.12);
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+  margin: 0; height: 100%; overflow: hidden;
+  background: var(--bg); color: var(--fg);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  overscroll-behavior: none;
+}
+
+#view {
+  position: fixed; inset: 0; width: 100vw; height: 100vh;
+  display: block; background: #000; touch-action: none;
+  /* Point-filter the canvas when the browser scales backing px -> screen px:
+     keep the fractal crisp (no bilinear blur), especially mid-zoom. Supersampling
+     does the smoothing at render time; the display upscale should stay sharp. */
+  image-rendering: crisp-edges;  /* fallback for browsers without `pixelated` */
+  image-rendering: pixelated;    /* wins where supported (last valid value) */
+}
+
+.hud {
+  position: fixed; top: env(safe-area-inset-top, 8px); left: 8px;
+  display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
+  pointer-events: none; font-variant-numeric: tabular-nums;
+}
+.hud-row { display: flex; gap: 8px; align-items: center; }
+.status, .zoom {
+  background: rgba(0, 0, 0, 0.55); padding: 4px 9px; border-radius: 8px;
+  font-size: 12px; color: var(--fg); backdrop-filter: blur(6px);
+}
+.zoom { color: var(--accent); font-weight: 600; }
+.coords-hud {
+  background: rgba(0, 0, 0, 0.55); padding: 3px 9px; border-radius: 8px;
+  font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted);
+  backdrop-filter: blur(6px); max-width: 86vw; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.coords-hud:empty { display: none; }
+
+/* Top-right corner utility buttons (help / fullscreen). Separate from the HUD,
+   which is pointer-events:none; these are interactive. */
+.corner {
+  position: fixed; top: calc(env(safe-area-inset-top, 0px) + 8px); right: 10px;
+  display: flex; gap: 8px; z-index: 20;
+}
+.corner-btn {
+  width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--border);
+  background: rgba(10, 14, 28, 0.7); color: var(--fg); font-size: 17px;
+  backdrop-filter: blur(8px); cursor: pointer; line-height: 1; padding: 0;
+}
+.corner-btn:active { background: #243056; }
+
+/* First-run gesture hint. pointer-events:none on the whole overlay so it never
+   intercepts the gesture that dismisses it (the tap also zooms, etc.). */
+.hint {
+  position: fixed; inset: 0; z-index: 40; pointer-events: none;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 6, 0.5); backdrop-filter: blur(2px);
+  opacity: 0; visibility: hidden; transition: opacity 0.25s ease, visibility 0.25s ease;
+}
+.hint.show { opacity: 1; visibility: visible; }
+.hint-card {
+  max-width: min(420px, 88vw); margin: 16px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+  padding: 20px 22px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.hint-card h2 { margin: 0 0 14px; font-size: 17px; font-weight: 600; }
+.hint-gestures { list-style: none; margin: 0; padding: 0; }
+.hint-gestures li { font-size: 14px; color: var(--fg); margin: 11px 0; line-height: 1.35; }
+.hint-gestures b { color: var(--accent); font-weight: 600; }
+.hint-gestures .dim { color: var(--muted); font-size: 12px; }
+.hint-foot {
+  margin-top: 16px; text-align: center; font-size: 12px; color: var(--muted);
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+
+.panel-toggle {
+  position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 14px); right: 14px;
+  width: 52px; height: 52px; border-radius: 50%; border: 1px solid var(--border);
+  background: var(--panel); color: var(--fg); font-size: 22px; z-index: 20;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+
+.panel {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+  max-height: 82vh; overflow-y: auto;
+  background: var(--panel); backdrop-filter: blur(12px);
+  border-top: 1px solid var(--border);
+  border-radius: 16px 16px 0 0;
+  padding: 12px 14px calc(env(safe-area-inset-bottom, 0px) + 16px);
+  transform: translateY(110%); transition: transform 0.25s ease;
+}
+.panel.open { transform: translateY(0); }
+
+.panel-head { display: flex; justify-content: space-between; align-items: center; }
+.panel-head h1 { font-size: 15px; margin: 4px 0 10px; font-weight: 600; }
+.icon-btn { background: none; border: none; color: var(--muted); font-size: 24px; }
+
+.row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+.btn {
+  flex: 1 1 auto; min-width: 70px; padding: 10px 12px; border-radius: 10px;
+  background: #1a2240; color: var(--fg); border: 1px solid var(--border);
+  font-size: 14px; cursor: pointer;
+}
+.btn:active { background: #243056; }
+.places .btn { flex: 1 1 40%; }
+
+.field { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; font-size: 13px; color: var(--muted); }
+.field em { color: var(--accent); font-style: normal; }
+.field input[type=range] { width: 100%; accent-color: var(--accent); height: 28px; }
+.field select, .coords input, .coords textarea {
+  width: 100%; background: #0c1226; color: var(--fg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px; font-size: 13px; font-family: ui-monospace, monospace;
+}
+.check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin: 8px 0; }
+
+.iter-row { display: flex; align-items: center; gap: 8px; }
+.iter-row input[type=range] { flex: 1 1 auto; min-width: 0; }
+.iter-row input[type=number] {
+  flex: 0 0 84px; width: 84px; background: #0c1226; color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+  font-size: 13px; font-family: ui-monospace, monospace;
+}
+
+.coords { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; margin: 12px 0; }
+.coords legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
+.coords label { display: block; font-size: 12px; color: var(--muted); margin: 6px 0; }
+.coords textarea { resize: vertical; word-break: break-all; }
+
+.about { margin-top: 8px; color: var(--muted); font-size: 12px; }
+.about summary { cursor: pointer; padding: 6px 0; }
+.debug { font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; color: var(--muted); }
+.tiny { font-size: 11px; line-height: 1.5; }
+
+@media (min-width: 720px) {
+  .panel { left: auto; right: 0; top: 0; bottom: 0; width: 360px; max-height: none;
+    border-radius: 0; border-left: 1px solid var(--border); transform: translateX(110%); }
+  .panel.open { transform: translateX(0); }
+}

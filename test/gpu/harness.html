@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>GPU validation harness</title></head>
+<body>
+<canvas id="gpu"></canvas>
+<script type="module">
+  import { GpuRenderer } from '/src/gpu/renderer.js';
+  import { compareNaive, comparePerturb, arbitrateNaive, computeReference } from '/src/gpu/validate.js';
+  import { precForRadius, fromDecimalString } from '/src/math/bignum.js';
+  import { chooseReference } from '/src/math/render.js';
+  import { toDouble } from '/src/math/bignum.js';
+  import { computeSeries } from '/src/math/series.js';
+  import { buildBLA, blaToFloat32 } from '/src/math/bla.js';
+  import { escapePerturb } from '/src/math/perturb.js';
+
+  let gpu = null;
+  window.__gpu = {
+    init(w, h) {
+      gpu = new GpuRenderer({ canvas: document.getElementById('gpu'), width: w, height: h });
+      return { supported: gpu.supported, ok: gpu.ok };
+    },
+    info() {
+      const gl = gpu.gl; const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      return { renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '?',
+               maxTexSize: gl.getParameter(gl.MAX_TEXTURE_SIZE) };
+    },
+    compareNaive(p) { return compareNaive(gpu, p); },
+    arbitrateNaive(p) { return arbitrateNaive(gpu, p); },
+    // Build a perturbation reference on the CPU for a deep view, then compare.
+    //   q: { re, im, radius, maxIter, width, height, checkStep, glitchTol }
+    comparePerturb(q) {
+      const r = this._refAndOffsets(q);
+      // Series approximation (optional): compute the SA seed coeffs on the CPU exactly as
+      // the worker/render.js would (grid + escape-guard; no coarse cap — non-binding, see
+      // tools/probe-sa-cap.mjs). The GPU renders WITH the seed; the CPU oracle below stays
+      // no-SA, so the comparison gates GPU-with-SA against the true no-SA escape counts.
+      let sa = null;
+      if (q.series) {
+        const scale = r.scale;
+        const dcxFar = r.ox + (q.width - 1) * scale, dcyFar = r.oy + (q.height - 1) * scale;
+        const dcHalfX = Math.max(Math.abs(r.ox), Math.abs(dcxFar));
+        const dcHalfY = Math.max(Math.abs(r.oy), Math.abs(dcyFar));
+        sa = computeSeries(r.ref, q.radius, dcHalfX, dcHalfY,
+          { maxIter: q.maxIter, ...(typeof q.series === 'object' ? q.series : {}) });
+      }
+      // BLA (optional): build the table on the CPU exactly as render.js/worker would, pack to
+      // floatexp texels, upload. The GPU renders WITH the table; the CPU oracle inside
+      // comparePerturb stays no-BLA, so this gates GPU(BLA[+SA]) against the TRUE escape counts —
+      // BLA's truncation drift must stay within the df64 envelope (it is far below it, per
+      // tools/crosscheck-bla + arbiter-bla). q.bla = true | { eps }.
+      const blaObj = q.bla ? this._blaTable(r, q) : null;
+      // q.blaOracle: feed the SAME BLA(+SA) to the CPU oracle so the comparison isolates the
+      // GPU-vs-CPU df64 gap (faithfulness — valid at any depth). Default off: the oracle is the
+      // true no-BLA escape count (correctness — only meaningful where BLA is accurate, ≥2^-120).
+      const res = comparePerturb(gpu, {
+        zx: r.ref.zx, zy: r.ref.zy, z2: r.ref.z2, refLen: r.ref.len,
+        ox: r.ox, oy: r.oy, scale: r.scale, maxIter: q.maxIter, bailoutSq: 1 << 16,
+        glitchTol: q.glitchTol ?? 0, width: q.width, height: q.height, checkStep: q.checkStep || 1,
+        df64: !!q.df64, fe: !!q.fe, rs: !!q.rs, sa, bla: !!q.bla,
+        oracleBla: (q.bla && q.blaOracle) ? blaObj : null,
+        oracleSa: (q.bla && q.blaOracle) ? sa : null,
+      });
+      res.refLen = r.ref.len; res.relocations = r.relocations; res.saSkip = sa ? sa.skip : 0;
+      res.blaMaxLevel = blaObj ? blaObj.maxLevel : 0;
+      return res;
+    },
+    // Build + upload the BLA table for view geometry `r` (from _refAndOffsets) and query `q`.
+    // Returns the buildBLA object (use .maxLevel). Mirrors render.js's dc-box + dcMax.
+    _blaTable(r, q) {
+      const dcxFar = r.ox + (q.width - 1) * r.scale, dcyFar = r.oy + (q.height - 1) * r.scale;
+      const dcMax = Math.hypot(Math.max(Math.abs(r.ox), Math.abs(dcxFar)),
+                               Math.max(Math.abs(r.oy), Math.abs(dcyFar)));
+      const eps = (typeof q.bla === 'object' && q.bla.eps) ? q.bla.eps : Math.pow(2, -30);
+      const bla = buildBLA(r.ref, dcMax, { eps });
+      gpu.uploadBLA(blaToFloat32(bla));
+      return bla;
+    },
+    // GPU-render-only timing (no CPU oracle): warm up, then time `reps` draws,
+    // each followed by gl.finish() to force the SwiftShader pipeline to drain.
+    // Returns the median/min/max wall-clock ms of one full-frame escape draw.
+    benchPerturb(q) {
+      const r = this._refAndOffsets(q);
+      let sa = null;
+      if (q.series) {
+        const dcxFar = r.ox + (q.width - 1) * r.scale, dcyFar = r.oy + (q.height - 1) * r.scale;
+        sa = computeSeries(r.ref, q.radius, Math.max(Math.abs(r.ox), Math.abs(dcxFar)),
+          Math.max(Math.abs(r.oy), Math.abs(dcyFar)),
+          { maxIter: q.maxIter, ...(typeof q.series === 'object' ? q.series : {}) });
+      }
+      const blaMaxLevel = q.bla ? this._blaTable(r, q).maxLevel : 0;   // build + upload before timing
+      const args = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: q.glitchTol ?? 0,
+        width: q.width, height: q.height, fastSkip: q.fastSkip, df64Esc: q.df64Esc, sa, bla: !!q.bla,
+        lean: q.lean, sqrOn: q.sqrOn, prefetch: q.prefetch };
+      const gl = gpu.gl;
+      let draw;
+      if (q.rs) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); draw = () => gpu.renderPerturbRescaled(args); }
+      else if (q.fe) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); draw = () => gpu.renderPerturbFloatexp(args); }
+      else if (q.df64) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); draw = () => gpu.renderPerturbDf64(args); }
+      else { gpu.uploadReference(r.ref.zx, r.ref.zy); draw = () => gpu.renderPerturb(args); }
+      // ANGLE/SwiftShader elides a draw whose framebuffer is never consumed and
+      // gl.finish() alone won't force it; a readPixels drains the pipeline (full
+      // draw executes on flush). Read one pixel so timing reflects compute, not
+      // the W*H*16-byte readback.
+      const px = new Float32Array(4);
+      const force = () => gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px);
+      draw(); force();                           // warm-up (compile + first dispatch)
+      const reps = q.reps || 3, times = [];
+      for (let k = 0; k < reps; k++) {
+        const t0 = performance.now();
+        draw(); force();
+        times.push(performance.now() - t0);
+      }
+      times.sort((a, b) => a - b);
+      return { refLen: r.ref.len, width: q.width, height: q.height, maxIter: q.maxIter,
+        saSkip: sa ? sa.skip : 0, blaMaxLevel,
+        ms: times[Math.floor(times.length / 2)], min: times[0], max: times[times.length - 1] };
+    },
+    // ds_sqr on/off sn diff (Spawn 27). Renders the SAME view with the dedicated ds_sqr/fe_sqr
+    // shader and with the historical ds_mul(a,a)/fe_mul(a,a) baseline, then diffs the full sn
+    // buffer. NOT required to be bit-identical (ds_sqr's low correction word may differ by ~1 ulp
+    // — the same scheduling freedom the lean barrier already grants), so this REPORTS the gap;
+    // the correctness GATE is validate:gpu[:real] vs the CPU oracle. q like benchPerturb.
+    crossSqr(q) {
+      const r = this._refAndOffsets(q);
+      let sa = null;
+      if (q.series) {
+        const dcxFar = r.ox + (q.width - 1) * r.scale, dcyFar = r.oy + (q.height - 1) * r.scale;
+        sa = computeSeries(r.ref, q.radius, Math.max(Math.abs(r.ox), Math.abs(dcxFar)),
+          Math.max(Math.abs(r.oy), Math.abs(dcyFar)),
+          { maxIter: q.maxIter, ...(typeof q.series === 'object' ? q.series : {}) });
+      }
+      const base = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: q.glitchTol ?? 0,
+        width: q.width, height: q.height, sa };
+      gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy);
+      const draw = (sqrOn) => {
+        if (q.rs) gpu.renderPerturbRescaled({ ...base, sqrOn });
+        else if (q.fe) gpu.renderPerturbFloatexp({ ...base, sqrOn });
+        else gpu.renderPerturbDf64({ ...base, sqrOn });
+        return gpu.readSn();
+      };
+      const a = draw(true), b = draw(false);
+      let nDiff = 0, iterDiff = 0, flips = 0, maxDsn = 0;
+      for (let k = 0; k < a.sn.length; k++) {
+        const s0 = a.sn[k], s1 = b.sn[k];
+        if (s0 === s1 && a.iter[k] === b.iter[k]) continue;
+        nDiff++;
+        if ((s0 < 0) !== (s1 < 0)) flips++;
+        else if (s0 >= 0) maxDsn = Math.max(maxDsn, Math.abs(s0 - s1));
+        if (a.iter[k] !== b.iter[k]) iterDiff++;
+      }
+      return { total: a.sn.length, nDiff, iterDiff, flips, maxDsn, saSkip: sa ? sa.skip : 0 };
+    },
+    // Generic render-args A/B sn diff (Spawn 27): renders the SAME view twice with the
+    // extra render-arg overlays qa vs qb (e.g. {prefetch:true} vs {}) and diffs the full
+    // sn buffer. For variants that CLAIM bit-identity (prefetch: same fetched values,
+    // same arithmetic) the expected result is nDiff === 0.
+    crossArgs(q, qa, qb) {
+      const r = this._refAndOffsets(q);
+      let sa = null;
+      if (q.series) {
+        const dcxFar = r.ox + (q.width - 1) * r.scale, dcyFar = r.oy + (q.height - 1) * r.scale;
+        sa = computeSeries(r.ref, q.radius, Math.max(Math.abs(r.ox), Math.abs(dcxFar)),
+          Math.max(Math.abs(r.oy), Math.abs(dcyFar)),
+          { maxIter: q.maxIter, ...(typeof q.series === 'object' ? q.series : {}) });
+      }
+      const base = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: q.glitchTol ?? 0,
+        width: q.width, height: q.height, sa };
+      gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy);
+      const draw = (extra) => {
+        if (q.rs) gpu.renderPerturbRescaled({ ...base, ...extra });
+        else if (q.fe) gpu.renderPerturbFloatexp({ ...base, ...extra });
+        else gpu.renderPerturbDf64({ ...base, ...extra });
+        return gpu.readSn();
+      };
+      const a = draw(qa), b = draw(qb);
+      let nDiff = 0, flips = 0, maxDsn = 0;
+      for (let k = 0; k < a.sn.length; k++) {
+        const s0 = a.sn[k], s1 = b.sn[k];
+        if (s0 === s1 && a.iter[k] === b.iter[k]) continue;
+        nDiff++;
+        if ((s0 < 0) !== (s1 < 0)) flips++;
+        else if (s0 >= 0) maxDsn = Math.max(maxDsn, Math.abs(s0 - s1));
+      }
+      return { total: a.sn.length, nDiff, flips, maxDsn, saSkip: sa ? sa.skip : 0 };
+    },
+    // INTERIOR-PRUNE UPPER-BOUND bench (Spawn 23, rescaled+SA only). Builds an EXACT interior
+    // mask with the CPU oracle (escapePerturb, same SA + geometry as the GPU render: row 0 =
+    // GL-bottom, matching readSn/validate.texelC), uploads it, then times the GPU frame while
+    // bailing oracle-interior pixels at n = skip + frac·(maxIter−skip). frac=1 = baseline (mask
+    // fetch paid, never fires); frac=0 = a perfect, free, zero-latency interior detector = the
+    // absolute wall-clock CEILING of interior detection at this coordinate. Also times a true
+    // no-mask run (uPrune=0) so the mask-fetch overhead is separated from the work saved, and
+    // does a full-buffer sn diff (baseline vs frac=0) as a correctness/alignment crosscheck.
+    benchPrune(q) {
+      const r = this._refAndOffsets(q);
+      const W = q.width, H = q.height, MI = q.maxIter;
+      let sa = null;
+      if (q.series) {
+        const dcxFar = r.ox + (W - 1) * r.scale, dcyFar = r.oy + (H - 1) * r.scale;
+        sa = computeSeries(r.ref, q.radius, Math.max(Math.abs(r.ox), Math.abs(dcxFar)),
+          Math.max(Math.abs(r.oy), Math.abs(dcyFar)),
+          { maxIter: MI, ...(typeof q.series === 'object' ? q.series : {}) });
+      }
+      const skip = sa ? sa.skip : 0;
+      const ref = { zx: r.ref.zx, zy: r.ref.zy, z2: r.ref.z2, len: r.ref.len };
+      const mask = new Float32Array(W * H);
+      let nInt = 0;
+      for (let j = 0; j < H; j++) {
+        for (let i = 0; i < W; i++) {
+          const dcx = r.ox + (i + 0.5) * r.scale, dcy = r.oy + (j + 0.5) * r.scale;
+          const o = escapePerturb(ref, dcx, dcy, MI, 1 << 16, 0, sa, null);
+          if (o.n >= MI) { mask[j * W + i] = 1; nInt++; }
+        }
+      }
+      gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy);
+      gpu.uploadPruneMask(mask, W, H);
+      const base = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len, maxIter: MI,
+        bailoutSq: 1 << 16, glitchTol: 0, width: W, height: H, sa };
+      const gl = gpu.gl, px = new Float32Array(4);
+      const force = () => gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px);
+      const time = (args) => {
+        const draw = () => gpu.renderPerturbRescaled(args);
+        draw(); force();                                    // warm-up
+        const reps = q.reps || 9, ts = [];
+        for (let k = 0; k < reps; k++) { const t0 = performance.now(); draw(); force(); ts.push(performance.now() - t0); }
+        ts.sort((a, b) => a - b); return ts[Math.floor(ts.length / 2)];
+      };
+      const out = { width: W, height: H, maxIter: MI, saSkip: skip, interior: nInt / (W * H) };
+      out.nomask = time({ ...base, prune: false });
+      const fracs = q.fracs || [1.0, 0.5, 0.25, 0.1, 0.0];
+      out.points = fracs.map((frac) => {
+        const pruneIter = Math.round(skip + frac * (MI - skip));
+        return { frac, pruneIter, ms: time({ ...base, prune: true, pruneIter }) };
+      });
+      // Correctness + alignment crosscheck: baseline (never fires) vs frac=0 (max prune) full sn.
+      // The prune touches ONLY oracle-interior pixels, which are interior (sn<0) either way, and
+      // never touches escapers — so a correctly-ALIGNED mask gives a byte-identical sn buffer.
+      gpu.renderPerturbRescaled({ ...base, prune: true, pruneIter: MI });
+      const a = gpu.readSn(); const sn0 = a.sn.slice();
+      gpu.renderPerturbRescaled({ ...base, prune: true, pruneIter: skip });
+      const b = gpu.readSn();
+      let insideFlip = 0, escDiff = 0;
+      for (let k = 0; k < W * H; k++) {
+        const i0 = sn0[k] < 0, i1 = b.sn[k] < 0;
+        if (i0 !== i1) insideFlip++;
+        else if (!i0 && sn0[k] !== b.sn[k]) escDiff++;
+      }
+      out.insideFlip = insideFlip; out.escDiff = escDiff;
+      return out;
+    },
+    // A/B the fast-skip against the exact path: render the SAME view with
+    // uFastSkip=1 and uFastSkip=0 and compare the full sn/iter buffers. The skip
+    // only elides provably-inert work, so the two must be BIT-IDENTICAL (maxAbs=0,
+    // diff=0). Any nonzero diff means the skip bound is wrong. q like benchPerturb.
+    crossCheckSkip(q) {
+      const r = this._refAndOffsets(q);
+      const base = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: q.glitchTol ?? 0,
+        width: q.width, height: q.height };
+      const draw = (fastSkip) => {
+        const args = { ...base, fastSkip };
+        if (q.rs) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbRescaled(args); }
+        else if (q.fe) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbFloatexp(args); }
+        else if (q.df64) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbDf64(args); }
+        else { gpu.uploadReference(r.ref.zx, r.ref.zy); gpu.renderPerturb(args); }
+        return gpu.readSn();
+      };
+      const off = draw(0), on = draw(1);
+      let diff = 0, maxAbs = 0, snDiff = 0, gl = 0;
+      for (let i = 0; i < off.sn.length; i++) {
+        if (off.iter[i] !== on.iter[i]) diff++;
+        const d = Math.abs(off.sn[i] - on.sn[i]);
+        if (isFinite(d) && d > maxAbs) maxAbs = d;
+        if (isFinite(d) && d > 0) snDiff++;
+        if (off.glitch[i] !== on.glitch[i]) gl++;
+      }
+      return { n: off.sn.length, iterDiff: diff, snDiff, maxAbs, glitchDiff: gl, refLen: r.ref.len };
+    },
+    // A/B strip-tiling against a single full-frame draw: render the SAME view as ONE
+    // draw, then again split into horizontal strips (scissor rows), and compare the
+    // full sn/iter buffers. The scissor keeps gl_FragCoord global, so the two MUST be
+    // BIT-IDENTICAL (iterDiff=0, maxAbs=0). Any nonzero diff means strip tiling changed
+    // a pixel (a scissor/viewport bug). q like benchPerturb, plus optional q.stripH.
+    crossCheckTiled(q) {
+      const r = this._refAndOffsets(q);
+      const base = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: q.glitchTol ?? 0,
+        width: q.width, height: q.height };
+      const upload = () => { if (q.df64 || q.fe || q.rs) gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); else gpu.uploadReference(r.ref.zx, r.ref.zy); };
+      const drawFull = (a) => { if (q.rs) gpu.renderPerturbRescaled(a); else if (q.fe) gpu.renderPerturbFloatexp(a); else if (q.df64) gpu.renderPerturbDf64(a); else gpu.renderPerturb(a); };
+      // single full-frame draw
+      upload(); drawFull(base); const single = gpu.readSn();
+      // strip-tiled: clear then draw row-strips via scissor
+      const stripH = q.stripH || Math.max(1, Math.round(q.height / 7));
+      upload(); gpu.clearSn(q.width, q.height, -1);
+      for (let y = 0; y < q.height; y += stripH) {
+        const h = Math.min(stripH, q.height - y);
+        drawFull({ ...base, stripY: y, stripH: h });
+      }
+      const tiled = gpu.readSn();
+      let iterDiff = 0, snDiff = 0, maxAbs = 0, glitchDiff = 0;
+      for (let i = 0; i < single.sn.length; i++) {
+        if (single.iter[i] !== tiled.iter[i]) iterDiff++;
+        const d = Math.abs(single.sn[i] - tiled.sn[i]);
+        if (isFinite(d) && d > maxAbs) maxAbs = d;
+        if (isFinite(d) && d > 0) snDiff++;
+        if (single.glitch[i] !== tiled.glitch[i]) glitchDiff++;
+      }
+      return { n: single.sn.length, stripH, iterDiff, snDiff, maxAbs, glitchDiff, refLen: r.ref.len };
+    },
+    // A/B the GPU BLA against the GPU no-BLA rescaled engine on the SAME deep view: render
+    // both, report the iteration/smooth drift. Unlike crossCheckSkip (BLA is NOT bit-identical
+    // — it drops dz²), so the gate is a SMALL bounded drift (the BLA truncation), matching the
+    // CPU crosscheck-bla/arbiter-bla envelope, NOT zero. The no-BLA pass is the already-validated
+    // rescaled engine, so this isolates the GPU BLA contribution. q like comparePerturb (+ q.bla
+    // = true|{eps}, optional q.series to compose SA). Returns drift stats + blaMaxLevel.
+    crossCheckBla(q) {
+      const r = this._refAndOffsets(q);
+      let sa = null;
+      if (q.series) {
+        const dcxFar = r.ox + (q.width - 1) * r.scale, dcyFar = r.oy + (q.height - 1) * r.scale;
+        sa = computeSeries(r.ref, q.radius, Math.max(Math.abs(r.ox), Math.abs(dcxFar)),
+          Math.max(Math.abs(r.oy), Math.abs(dcyFar)), { maxIter: q.maxIter });
+      }
+      const base = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len, maxIter: q.maxIter,
+        bailoutSq: 1 << 16, glitchTol: 0, width: q.width, height: q.height, sa };
+      gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy);
+      gpu.renderPerturbRescaled({ ...base, bla: false });
+      const off = gpu.readSn();
+      const blaMaxLevel = this._blaTable(r, q).maxLevel;
+      gpu.renderPerturbRescaled({ ...base, bla: true });
+      const on = gpu.readSn();
+      let n = 0, iterDiff = 0, near = 0, insideDiff = 0, maxAbs = 0, sumAbs = 0, snN = 0, maxIterDiff = 0;
+      for (let i = 0; i < off.sn.length; i++) {
+        const offIn = off.sn[i] < 0, onIn = on.sn[i] < 0;
+        n++;
+        if (offIn !== onIn) { insideDiff++; continue; }
+        if (offIn) continue;
+        const d = Math.abs(off.iter[i] - on.iter[i]);
+        if (d > 0) { iterDiff++; if (d <= 2) near++; if (d > maxIterDiff) maxIterDiff = d; }
+        const sd = Math.abs(off.sn[i] - on.sn[i]);
+        if (isFinite(sd)) { if (sd > maxAbs) maxAbs = sd; sumAbs += sd; snN++; }
+      }
+      return { n, iterDiff, near, insideDiff, maxIterDiff, maxAbs, meanAbs: snN ? sumAbs / snN : 0,
+        refLen: r.ref.len, blaMaxLevel, saSkip: sa ? sa.skip : 0 };
+    },
+    // Diagnostic (Spawn 8): render the df64 perturbation AND the f32 perturbation
+    // on the SAME view and report how much they DISAGREE. If df64 has collapsed to
+    // float32 on this GPU (compiler reassociation), the two are nearly identical
+    // (iterMismFrac ~ 0); if df64 is intact, they differ on the chaotic boundary
+    // (the df64-vs-f32 precision gap, same envelope as df64-vs-oracle).
+    compareDf64VsF32(q) {
+      const r = this._refAndOffsets(q);
+      const base = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: 0, width: q.width, height: q.height };
+      gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbDf64(base);
+      const a = gpu.readSn();
+      gpu.uploadReference(r.ref.zx, r.ref.zy); gpu.renderPerturb(base);
+      const b = gpu.readSn();
+      let n = 0, iterDiff = 0, maxDiff = 0;
+      for (let i = 0; i < a.sn.length; i++) {
+        const ai = a.iter[i], bi = b.iter[i];
+        n++;
+        const d = Math.abs(ai - bi);
+        if (d > 0) iterDiff++;
+        if (d > maxDiff) maxDiff = d;
+      }
+      return { n, iterDiff, iterMismFrac: iterDiff / n, maxDiff, refLen: r.ref.len };
+    },
+    // Return the raw iteration buffer for one engine+view, so two BACKENDS can be
+    // compared pixel-for-pixel (df64 on SwiftShader == df64 on the GPU iff the GPU
+    // df64 is bit-faithful). Returns a plain array (serializable across page.evaluate).
+    renderIter(q) {
+      const r = this._refAndOffsets(q);
+      const args = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: 0, width: q.width, height: q.height,
+        fastSkip: q.fastSkip };
+      if (q.rs) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbRescaled(args); }
+      else if (q.fe) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbFloatexp(args); }
+      else if (q.df64) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbDf64(args); }
+      else { gpu.uploadReference(r.ref.zx, r.ref.zy); gpu.renderPerturb(args); }
+      const { sn, iter } = gpu.readSn();
+      return { iter: Array.from(iter), sn: Array.from(sn), refLen: r.ref.len };
+    },
+    // Debug: render one engine and report escape stats + a few sample iter values.
+    debugOne(q) {
+      const r = this._refAndOffsets(q);
+      const args = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: 0, width: q.width, height: q.height,
+        fastSkip: q.fastSkip };
+      if (q.rs) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbRescaled(args); }
+      else if (q.fe) { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbFloatexp(args); }
+      else { gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy); gpu.renderPerturbDf64(args); }
+      const { sn, iter } = gpu.readSn();
+      let escaped = 0, inside = 0; const samples = [];
+      for (let i = 0; i < sn.length; i++) { if (sn[i] < 0) inside++; else escaped++; }
+      for (let i = 0; i < 5; i++) samples.push({ iter: iter[i], sn: +sn[i].toFixed(2) });
+      return { escaped, inside, refLen: r.ref.len, samples,
+               refZ0: [r.ref.zx[0], r.ref.zy[0]], refZlast: [r.ref.zx[r.ref.len - 1], r.ref.zy[r.ref.len - 1]] };
+    },
+    // Direct agreement of the rescaled engine vs the floatexp engine on the SAME
+    // deep view. They are two finite-precision methods (different arithmetic), so
+    // they aren't bit-identical, but they share the exact rebase logic and should
+    // agree on all but a few chaotic boundary pixels (same envelope as fe-vs-df64).
+    compareRescaledVsFe(q) {
+      const r = this._refAndOffsets(q);
+      const args = { ox: r.ox, oy: r.oy, scale: r.scale, refLen: r.ref.len,
+        maxIter: q.maxIter, bailoutSq: 1 << 16, glitchTol: q.glitchTol ?? 0,
+        width: q.width, height: q.height };
+      gpu.uploadReferenceDf64(r.ref.zx, r.ref.zy);
+      gpu.renderPerturbFloatexp(args); const fe = gpu.readSn();
+      gpu.renderPerturbRescaled(args); const rs = gpu.readSn();
+      let n = 0, iterDiff = 0, near = 0, insideDiff = 0, maxAbs = 0, sumAbs = 0, snN = 0;
+      for (let i = 0; i < fe.sn.length; i++) {
+        const feIn = fe.sn[i] < 0, rsIn = rs.sn[i] < 0;
+        n++;
+        if (feIn !== rsIn) { insideDiff++; continue; }
+        if (feIn) continue;
+        const d = Math.abs(fe.iter[i] - rs.iter[i]);
+        if (d > 0) { iterDiff++; if (d <= 2) near++; }
+        const sd = Math.abs(fe.sn[i] - rs.sn[i]);
+        if (isFinite(sd)) { if (sd > maxAbs) maxAbs = sd; sumAbs += sd; snN++; }
+      }
+      return { n, iterDiff, near, insideDiff, maxAbs, meanAbs: snN ? sumAbs / snN : 0, refLen: r.ref.len };
+    },
+    // Shared: build a CPU reference for the view and the dc origin/step offsets the
+    // shader needs (mirrors render.js / comparePerturb's geometry).
+    _refAndOffsets(q) {
+      const prec = precForRadius(q.radius, 80);
+      const cx = fromDecimalString(q.re, prec);
+      const cy = fromDecimalString(q.im, prec);
+      const viewHP = { x: cx, y: cy, prec, radius: q.radius, width: q.width, height: q.height };
+      const sel = chooseReference(viewHP, q.maxIter);
+      const ref = sel.ref, center = sel.center;
+      const aspect = q.width / q.height;
+      const scale = (2 * q.radius) / q.height;
+      const refOffX = toDouble(center.x - cx, prec);
+      const refOffY = toDouble(center.y - cy, prec);
+      const ox = -q.radius * aspect - refOffX;
+      const oy = -q.radius - refOffY;
+      return { ref, ox, oy, scale, relocations: sel.relocations };
+    },
+  };
+  window.__ready = true;
+</script>
+</body>
+</html>
