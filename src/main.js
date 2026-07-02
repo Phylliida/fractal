@@ -23,11 +23,17 @@ function updateStatus(s) {
   const el = $('status');
   if (s.error) { el.textContent = '⚠ ' + s.error.split('\n')[0]; return; }
   if (s.phase === 'maxdepth') { el.textContent = '⚠ maximum zoom depth reached (double-precision limit)'; return; }
+  if (s.phase === 'gpuverify' && s.ok === false) {
+    el.textContent = `⚠ GPU precision self-test failed (${Math.round(s.mismFrac * 100)}% of sampled pixels ` +
+      `differ from the CPU reference) — deep detail may be off on this GPU; toggle "GPU acceleration" off to compare`;
+    return;
+  }
   if (s.phase === 'start') el.textContent = `rendering · ${s.engine} · ${s.maxIter} it`;
   else if (s.phase === 'reference') el.textContent = `reference orbit ${pct(s.i, s.total)}`;
   else if (s.phase === 'render') el.textContent = `rendering ${pct(s.i, s.total)}`;
   else if (s.phase === 'done') {
-    el.textContent = `${s.engine} · done${s.glitches ? ' · ' + s.glitches + ' glitch?' : ''}`;
+    el.textContent = `${s.engine} · done${s.glitches ? ' · ' + s.glitches + ' glitch?' : ''}` +
+      (s.gpuVerify === 'fail' ? ' · ⚠ GPU self-test failed' : '');
     $('debug').textContent = debugText(s);
     window.__lastDone = s;
     window.__doneCount = (window.__doneCount || 0) + 1; // test sync signal
@@ -108,6 +114,7 @@ function writeHash() {
   p.set('i', s.maxIter); p.set('p', viewer.paletteOpts.paletteId);
   p.set('cy', viewer.paletteOpts.cycle); p.set('sh', viewer.paletteOpts.shift);
   p.set('ss', viewer.ss);
+  p.set('res', viewer.resScale);
   history.replaceState(null, '', '#' + p.toString());
 }
 function readHash() {
@@ -118,6 +125,15 @@ function readHash() {
   if (p.get('cy')) viewer.paletteOpts.cycle = +p.get('cy');
   if (p.get('sh')) viewer.paletteOpts.shift = +p.get('sh');
   if (p.get('ss')) viewer.ss = Math.max(1, Math.min(4, +p.get('ss')));
+  // Resolution setting rides in the URL too (Danielle's request — originally kept
+  // per-device to avoid shared-link degradation traps; the panel select shows the
+  // state, so a recipient can see + undo it). A change needs a RESIZE (backing dims),
+  // not just a re-render — done below after setState; the interim render is cancelled.
+  let needResize = false;
+  if (p.get('res')) {
+    const r = Math.max(1, Math.min(4, Math.round(+p.get('res')) || 1));
+    if (r !== viewer.resScale) { viewer.resScale = r; needResize = true; }
+  }
   // writeHash records i= on EVERY url, so for almost all shared/bookmarked views the
   // recorded i is just the AUTO value at capture time. Pinning autoIter=false on every
   // load silently froze the iteration budget — zoom deeper from a loaded URL and the
@@ -132,6 +148,7 @@ function readHash() {
                     maxIter: manualPin ? iRaw : undefined });
   if (manualPin) { viewer.autoIter = false; $('autoIter').checked = false; }
   else if (iRaw !== undefined) { viewer.autoIter = true; $('autoIter').checked = true; }
+  if (needResize) viewer.resize();   // re-sizes the backing + re-renders at the new res
   syncControls();
   return true;
 }
@@ -184,9 +201,9 @@ $('lowPower').addEventListener('change', (e) => { viewer.setLowPower(e.target.ch
 $('series').addEventListener('change', (e) => viewer.setSeries(e.target.checked));
 $('ss').addEventListener('change', (e) => { viewer.setSupersample(+e.target.value); scheduleHash(); });
 // Resolution (render pixels): full/half/third of the true canvas resolution.
-// Per-device speed choice — deliberately NOT written to the URL hash (a shared link
-// must never carry a degraded-resolution trap; cf. the Spawn-31 ss=1/i= findings).
-$('resScale').addEventListener('change', (e) => viewer.setResScale(+e.target.value));
+// URL-persisted at Danielle's request (Spawn 34) — like ss, it rides in the hash so a
+// bookmarked view reproduces its full look/perf; the panel select keeps it visible.
+$('resScale').addEventListener('change', (e) => { viewer.setResScale(+e.target.value); scheduleHash(); });
 
 $('palette').addEventListener('change', (e) => { viewer.setPalette({ paletteId: e.target.value }); scheduleHash(); });
 $('cycle').addEventListener('input', (e) => { $('cycleVal').textContent = e.target.value; viewer.setPalette({ cycle: +e.target.value }); scheduleHash(); });

@@ -355,6 +355,48 @@ exercise hit+extend live; gpu 10; perf 2) + mobile gpu 10/10. probe-wall spot re
 (BITS=700,1010) after the iterateOrbit refactor: 0 mismatch. bench-ref unchanged (the refactor is
 op-identical; the store callback is JIT-inlined).
 
+### ✅ RUNTIME GPU PRECISION SELF-TEST (Spawn 33 — Danielle is on a PIXEL 8, i.e. Mali) — warning-only by her choice
+CONTEXT SHIFT: Danielle uses the viewer on a Pixel 8 (Mali/Tensor G3) — a GPU class NEVER validated
+here (all shader correctness is empirical-per-GPU: NVIDIA + SwiftShader only; the df64 barrier NOTES
+explicitly flag portability). The Spawn-8 backlog item is finally built: after the FIRST deep GPU
+frame of a session, the viewer samples an 8×8 grid of the rendered escape data (targeted 1×1
+readbacks — renderer.sampleSn / worker 'sampleSn' / client.sampleSn) and replays those pixels through
+escapePerturb in a throwaway pool worker with the EXACT same reference/SA/geometry (`_lastDeepParams`
++ the Spawn-30 ref cache make this free). Comparison = validate.js faithfulness mode (same SA, |Δn|≤2,
+inside-flips are mismatches). Verdict needs ≥6 sampled ESCAPERS (interior-heavy views are inconclusive
+→ silently retried on the next deep frame — the 5×5 grid was one escaper short on the test view, hence
+8×8); mismatch >25% of escapers ⇒ FAIL (healthy GPUs measure 0–1%; the known NVIDIA df64-collapse class
+measured 22–99%). ON FAIL (Danielle's explicit choice — WARNING-ONLY, NO forced CPU fallback): rendering
+STAYS on the GPU; a persistent status warning appears ("⚠ GPU precision self-test failed (N%…) — toggle
+'GPU acceleration' off to compare") + a "· ⚠ GPU self-test failed" suffix on every later done-line. The
+existing GPU toggle is the manual fallback. Cost: ~ms, once per session; skipped under the glitch
+overlay. Test hook `viewer.__forceVerifyFail`; both paths verified headless (healthy → silent verified,
+GPU stays; injected fail → warning + GPU stays). Gates: crosscheck:offscreen pixel-identical, 44 unit,
+gpu+viewer e2e green. IF HER PIXEL 8 SHOWS THE WARNING: the Mali driver breaks the df64 barrier → the
+next work item is a Mali-specific barrier variant (probe:barrier methodology, on-device).
+
+### 🐛→✅ GESTURES NEVER CANCELLED THE GPU WORKER (Spawn 33, Danielle: "can't interrupt a render; UI laggy until it finishes")
+Since the OffscreenCanvas migration (Spawn 24), `_beginPreview()` — the universal gesture entry that is
+SUPPOSED to cancel the in-flight render — bumped gen and terminated the CPU pool but NEVER sent the GPU
+worker a `cancel` message (only the context-loss path did). Consequence: the main thread dropped the
+stale strips (gen guard), but the WORKER kept rendering every remaining strip of the abandoned frame
+at full GPU cost — competing with the preview compositing, any other GPU tenant, and (on non-gesture
+supersedes like "Go", where the new plan only reaches the worker after a ref build) delaying the next
+frame. Capped-res frames kept the stale tail short enough to hide for 9 spawns; Spawn 32's full-
+resolution frames stretched it to user-visible "have to wait for it to finish". TWO omissions fixed:
+- `_beginPreview()` and `render()` now post `gpuWorker.cancel(gen)` immediately after the gen bump.
+- The worker's strip loop gains a MACROTASK YIELD after each ack (message-ordering subtlety: the ack
+  that wakes the loop is processed BEFORE any cancel/render message that arrived after it — without
+  the hop the loop synchronously submits one more full strip before ever seeing the cancellation).
+Measured (tools/probe-interrupt.mjs — warm-cache, full-res 1400×900, interrupt mid-strips; the OLD arm
+stubs client.cancel to a no-op): stale strips arriving AFTER the zoom: 8ms tail → ≤1ms (none). On an
+IDLE 3090 the old tail was only ~1–2 strips, so zoom→settled barely moves there — the honest scoping:
+the win scales with strip duration (slow/contended GPUs, full-res deep frames = exactly the reported
+conditions), and it removes ALL wasted stale GPU work during gestures. Gates: crosscheck:offscreen
+ALL PIXEL-IDENTICAL (the worker loop was touched), 44 unit, gpu+viewer e2e green. NOTE the remaining
+DESIGNED latency: a settle render still waits the 220ms debounce + the frame itself; interruption =
+instant preview + freed GPU, not instant sharp pixels.
+
 ### ✅ FULL-RESOLUTION RENDERING + Resolution setting (Spawn 32) — the ACTUAL "blocky detail" root cause
 Danielle's third message nailed it: the render resolution was LOWER than the screen. `resize()` capped
 the backing store at MAX_BACKING=1100 on the long edge (a mobile-era guard) — on any larger window the

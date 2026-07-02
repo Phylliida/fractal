@@ -521,6 +521,22 @@ export class GpuRenderer {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
+  // Sample individual sn-FBO texels (Spawn 33 — the runtime GPU precision self-test).
+  // points: [{x, y}] in compute/GL coords (row 0 = bottom, matching the dc mapping
+  // dc = origin + (x+0.5, y+0.5)·scale). Returns { sn, iter } arrays. Targeted 1×1
+  // readPixels — no full-buffer readback (the FBO can be 1.5M+ texels at full res).
+  sampleSn(points) {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._fbo);
+    const sn = new Float32Array(points.length), iter = new Float32Array(points.length);
+    const px = new Float32Array(4);
+    for (let i = 0; i < points.length; i++) {
+      gl.readPixels(points[i].x, points[i].y, 1, 1, gl.RGBA, gl.FLOAT, px);
+      sn[i] = px[0]; iter[i] = px[1];
+    }
+    return { sn, iter };
+  }
+
   // Read the float sn buffer back (RGBA32F). Returns { sn, iter, glitch } as
   // Float32Arrays length w*h, in GL row order (row 0 = bottom).
   readSn() {

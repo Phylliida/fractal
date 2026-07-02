@@ -74,6 +74,9 @@ export class GpuWorkerClient {
         if (m.gen !== this._gen || m.seq !== this._recolorSeq || !this._recolorCb) { if (m.bitmap) m.bitmap.close?.(); break; }
         { const cb = this._recolorCb; this._recolorCb = null; cb(m.bitmap); }
         break;
+      case 'snSample':
+        if (this._sampleCb) { const cb = this._sampleCb; this._sampleCb = null; cb(m.sn ? { sn: m.sn, iter: m.iter } : null); }
+        break;
       case 'contextlost':
         this.lost = true;
         if (this.onContextLost) { try { this.onContextLost(); } catch { /* noop */ } }
@@ -123,6 +126,16 @@ export class GpuWorkerClient {
 
   // Supersede any in-flight render (the worker bails its strip loop on a gen bump).
   cancel(gen) { this._gen = gen; this._handlers = null; if (!this._disposed) this.worker.postMessage({ type: 'cancel', gen }); }
+
+  // Sample sn/iter at scattered texels of the last completed frame (Spawn 33 — the
+  // runtime GPU precision self-test). Resolves null if the frame was superseded.
+  sampleSn(gen, points) {
+    if (this._disposed) return Promise.resolve(null);
+    return new Promise((res) => {
+      this._sampleCb = res;
+      this.worker.postMessage({ type: 'sampleSn', gen, points });
+    });
+  }
 
   // Test-only: simulate a GPU context loss / restore on the worker's OffscreenCanvas, so the
   // mobile recovery path (worker→main forwarding → CPU detour → GPU on restore) is exercisable

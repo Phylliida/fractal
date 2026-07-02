@@ -43,11 +43,41 @@ self.onmessage = (e) => {
     if (m.type === 'computeRef') computeRef(m);
     else if (m.type === 'extendRef') extendRef(m);
     else if (m.type === 'computeSA') computeSA(m);
+    else if (m.type === 'verifyPixels') verifyPixels(m);
     else if (m.type === 'render') renderBands(m);
   } catch (err) {
     self.postMessage({ type: 'error', gen: m.gen, message: String((err && err.stack) || err) });
   }
 };
+
+// Runtime GPU precision SELF-TEST oracle (Spawn 33). The viewer samples scattered
+// pixels of a just-completed deep GPU frame and sends them here with the SAME
+// reference + SA + geometry the GPU used; escapePerturb (the CPU engine — itself
+// BigInt-validated by probe-wall) recomputes each point and the mismatch counts go
+// back. The comparison mirrors validate.js comparePerturb's faithfulness mode
+// (CPU WITH the same SA, |Δn| ≤ 2 tolerated, inside-flips are mismatches) — the
+// thing this detects is a GPU/driver df64 breakdown on hardware we never tested
+// (e.g. a mobile GPU whose compiler defeats the optimization barrier).
+// in : { type:'verifyPixels', gen, zx, zy, z2, len, offX, offY, scale, maxIter, sa,
+//        points: [{x,y}], gpuSn: Float32Array, gpuIter: Float32Array }
+// out: { type:'pixelsVerified', gen, compared, escapers, mism }
+function verifyPixels(m) {
+  const ref = { zx: m.zx, zy: m.zy, z2: m.z2, len: m.len };
+  let compared = 0, escapers = 0, mism = 0;
+  for (let k = 0; k < m.points.length; k++) {
+    const pt = m.points[k];
+    const dcx = m.offX + (pt.x + 0.5) * m.scale;
+    const dcy = m.offY + (pt.y + 0.5) * m.scale;
+    const o = escapePerturb(ref, dcx, dcy, m.maxIter, 1 << 16, 0, m.sa || null);
+    const cpuInside = o.n >= m.maxIter, gpuInside = m.gpuSn[k] < 0;
+    compared++;
+    if (cpuInside && gpuInside) continue;          // interior/interior agreement
+    escapers++;
+    if (cpuInside !== gpuInside) { mism++; continue; }
+    if (Math.abs(m.gpuIter[k] - o.n) > 2) mism++;
+  }
+  self.postMessage({ type: 'pixelsVerified', gen: m.gen, compared, escapers, mism });
+}
 
 // (Re)compute the series-approximation coefficients for a CACHED reference orbit
 // (Spawn 30). computeSeries is a heavy scan (hundreds of ms at extreme depth — it

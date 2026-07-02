@@ -191,6 +191,9 @@ export class Viewer {
     this.img = null;          // ImageData of current render
     this.dpr = 1;
     this.resScale = 1;      // Resolution setting: 1=full, 2=half, 3=third (setResScale)
+    this._gpuDeepVerified = false;   // runtime GPU precision self-test (Spawn 33)
+    this._gpuDeepUntrusted = false;  // warning-only: rendering stays on the GPU
+    this._lastDeepParams = null;
     this.backingW = 0; this.backingH = 0;
     this.rendering = false;
     this._tilesLeft = 0;
@@ -239,9 +242,9 @@ export class Viewer {
     this.render();
   }
 
-  // Resolution setting: 1 = full canvas resolution (default), 2|3 = half/third
-  // (per-device speed choice — deliberately NOT URL-persisted, like lowPower/HQ,
-  // so a shared link never carries a degraded-resolution trap).
+  // Resolution setting: 1 = full canvas resolution (default), 2|3 = half/third.
+  // URL-persisted as `res=` (Danielle's request, Spawn 34); the panel select keeps
+  // the state visible so a shared reduced-res link is inspectable + undoable.
   setResScale(v) {
     const r = Math.max(1, Math.min(4, Math.round(v) || 1));
     if (r === this.resScale) return;
@@ -517,6 +520,10 @@ export class Viewer {
     this._clearPresent();
     this._updateComputeSize();
     this.gen++;
+    // Stop any in-flight GPU-worker strip loop NOW (Spawn 33): on a non-gesture
+    // supersede (setState/"Go"/toggles) the new plan may reach the worker only after
+    // a reference/SA build — without this, the stale frame burns the GPU meanwhile.
+    if (this.gpuWorker) this.gpuWorker.cancel(this.gen);
     this.T = null; // clear preview transform; we render fresh
     this.rendering = true;
     this._glitchAcc = 0;
@@ -679,7 +686,61 @@ export class Viewer {
     }
     this.onStatus({ phase: 'done', engine, glitches: g, refLen: meta.refLen || 0,
                     relocations: meta.relocations || 0, zoom: this.zoomLevel(),
-                    saSkip: this._saSkip });
+                    saSkip: this._saSkip,
+                    gpuVerify: this._gpuDeepUntrusted ? 'fail' : (this._gpuDeepVerified ? 'ok' : null) });
+    // Runtime GPU precision SELF-TEST (Spawn 33): once per session, after the first deep
+    // GPU frame completes, spot-check sampled pixels against the CPU oracle (which is
+    // BigInt-validated). Detects a GPU/driver df64 breakdown on hardware never tested
+    // (e.g. a mobile GPU whose compiler defeats the optimization barrier — the barrier
+    // placement is empirical-per-GPU). WARNING-ONLY by design (Danielle's call): a
+    // failure keeps rendering on the GPU and surfaces a persistent warning; the "GPU
+    // acceleration" toggle is the manual fallback. Async + off-main; ~ms of work.
+    if (engine.startsWith('gpu-perturb') && !this._gpuDeepVerified && !this._gpuDeepUntrusted &&
+        !this.showGlitches && this._lastDeepParams && this._refCache) {
+      const gen = this.gen;
+      setTimeout(() => { this._verifyDeepGpu(gen).catch(() => { /* diagnostic only — never break rendering */ }); }, 0);
+    }
+  }
+
+  // The self-test body: sample a grid of the just-rendered frame's escape data
+  // (targeted 1×1 readbacks), replay those pixels through escapePerturb in a
+  // throwaway worker with the exact same reference/SA/geometry, compare. Verdict
+  // needs ≥6 sampled escapers (else inconclusive — retries on the next deep frame);
+  // mismatch fraction > 0.25 of escapers ⇒ warn (healthy GPUs measure 0–1%; the
+  // known NVIDIA-class df64 collapse measured 22–99%).
+  async _verifyDeepGpu(gen) {
+    const p = this._lastDeepParams, c = this._refCache;
+    if (!p || !c || gen !== this.gen) return;
+    const G = 8, pts = [];   // 64 samples: interior-heavy deep views still yield enough escapers
+    for (let j = 0; j < G; j++) {
+      for (let i = 0; i < G; i++) {
+        pts.push({ x: Math.min(p.cW - 1, Math.round(((i + 0.5) / G) * p.cW)),
+                   y: Math.min(p.cH - 1, Math.round(((j + 0.5) / G) * p.cH)) });
+      }
+    }
+    const sample = this._useOffscreen() && this.gpuWorker
+      ? await this.gpuWorker.sampleSn(gen, pts)
+      : (this.gpu && !this.gpu.lost ? this.gpu.sampleSn(pts) : null);
+    if (!sample || gen !== this.gen) return;       // superseded — retry next deep frame
+    const result = await new Promise((resolve) => {
+      const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+      w.onmessage = (e) => { w.terminate(); resolve(e.data); };
+      w.onerror = () => { w.terminate(); resolve(null); };
+      w.postMessage({ type: 'verifyPixels', gen, zx: c.zx, zy: c.zy, z2: c.z2, len: p.len,
+                      offX: p.offX, offY: p.offY, scale: p.scale, maxIter: p.maxIter,
+                      sa: p.sa, points: pts, gpuSn: sample.sn, gpuIter: sample.iter });
+    });
+    if (!result || result.type !== 'pixelsVerified') return;
+    let { escapers, mism } = result;
+    if (this.__forceVerifyFail) { escapers = result.compared; mism = result.compared; } // test hook
+    if (escapers < 6) return;                      // inconclusive view — retry next deep frame
+    const mismFrac = mism / escapers;
+    if (mismFrac > 0.25) {
+      this._gpuDeepUntrusted = true;
+      this.onStatus({ phase: 'gpuverify', ok: false, mismFrac });
+    } else {
+      this._gpuDeepVerified = true;
+    }
   }
 
   _gpuFail(e) {
@@ -968,6 +1029,10 @@ export class Viewer {
       const args = { ox: p.offX, oy: p.offY, scale: p.scale, refLen: p.len,
                      maxIter: this.maxIter, glitchTol: g ? this.glitchTol : 0,
                      fastSkip: g ? 0 : 1, width: W, height: H, sa: g ? null : p.sa };
+      // What the GPU is actually rendering with — the runtime precision self-test
+      // (Spawn 33) replays sampled pixels through the CPU oracle with EXACTLY these.
+      this._lastDeepParams = { offX: p.offX, offY: p.offY, scale: p.scale, len: p.len,
+                               maxIter: this.maxIter, sa: args.sa, cW: W, cH: H };
       // The deep floatexp-precision band uses the RESCALED engine: same depth range and
       // ~46-bit precision as renderPerturbFloatexp (it still does escape/rebase in exact
       // floatexp), but a ~1.3-2× faster shared-exponent update. renderPerturbFloatexp
@@ -1032,6 +1097,9 @@ export class Viewer {
     // Strip budget on the POST-SA-SKIP worst case (mirrors _setSA's active condition —
     // an inactive/absent seed means pixels really do run from iteration 0). See _stripRows.
     const skip = (sa && sa.skip > 0 && sa.skip < this.maxIter) ? sa.skip : 0;
+    // Self-test inputs (Spawn 33) — see _renderGpuPerturb.
+    this._lastDeepParams = { offX: p.offX, offY: p.offY, scale: p.scale, len: p.len,
+                             maxIter: this.maxIter, sa, cW: W, cH: H };
     this._dispatchWorkerRender({
       gen, engine: fe ? 'perturb-fe' : 'perturb', W, H, ss: this._effSS, maxIter: this.maxIter,
       stripRows: this._stripRows(skip), paletteId: this.paletteOpts.paletteId, color: this._gpuColorOpts(),
@@ -1217,6 +1285,13 @@ export class Viewer {
     this.T = { a: 1, e: 0, f: 0 };
     this.gen++;                 // invalidate any in-flight worker messages
     this._terminatePool();
+    // Cancel the GPU worker's strip loop too (Spawn 33 — found by Danielle: zooming
+    // mid-render felt blocked). Bumping gen only makes the MAIN thread drop incoming
+    // strips; without this message the worker kept rendering every remaining strip of
+    // the stale frame at full GPU cost, and the settle render queued behind it — a
+    // tail that full-resolution frames stretched to seconds. The context-loss path
+    // always did this; gestures just never sent it.
+    if (this.gpuWorker) this.gpuWorker.cancel(this.gen);
     this.rendering = false;
   }
 

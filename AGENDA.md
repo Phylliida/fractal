@@ -552,6 +552,31 @@ See NOTES.md for architecture, math, and decisions.
    bit-exact oracle for that port. Full plan in NOTES "NEXT — GPU PORT".
 
 ## Progress log (newest first)
+- Spawn 34 (Danielle: "include the screen resolution and AA in the URL"): `res=` now rides in the hash
+  alongside the existing `ss=` (AA was already there) — writeHash records it, readHash applies it with a
+  proper RESIZE (backing dims change, not just a re-render; the interim render is cancelled by the
+  Spawn-33 cancel). This user-overrides the Spawn-32 "don't persist res" decision; the panel select
+  keeps a shared reduced-res link visible + undoable. Verified both directions headless (load res=2&ss=3
+  → applied + select synced; select change → hash updated); viewer e2e green.
+- Spawn 33b (Danielle revealed she's on a PIXEL 8 — Mali/Tensor G3, a GPU class never validated here):
+  built the Spawn-8 backlog item — a runtime GPU precision SELF-TEST. After the first deep GPU frame per
+  session, 8×8 sampled pixels are replayed through the CPU oracle (same ref/SA/geometry via the ref
+  cache; throwaway worker; ~ms). >25% escaper mismatch ⇒ persistent warning; per Danielle's explicit
+  choice it is WARNING-ONLY (no forced CPU fallback — the GPU toggle is the manual escape). Detects
+  df64/driver breakdowns on untested hardware (Mali!). Test hook __forceVerifyFail; both paths verified
+  headless; crosscheck:offscreen pixel-identical; 44 unit; gpu+viewer e2e green. If her Pixel warns →
+  next item: Mali-specific barrier variant. ALSO: mobile perf guidance — full-res (Spawn 32) is ~2.8×
+  heavier on a Pixel 8; Resolution Half restores the old cost; the interrupt fix (33) matters MOST there.
+- Spawn 33 (Danielle: "can't interrupt a mid-render zoom; UI laggy until it finishes"): found a
+  Spawn-24-era omission — _beginPreview/render() never sent the GPU worker a `cancel` (only context-loss
+  did), so abandoned frames rendered ALL remaining strips at full GPU cost and (on ref-build supersedes)
+  delayed the next frame; full-res frames (Spawn 32) made the tail user-visible. Fixed: cancel posted on
+  gesture start + render supersede; worker strip loop gains a macrotask yield (ack-before-cancel message
+  ordering meant one extra strip was submitted before the cancel was seen). probe-interrupt.mjs (new)
+  A/Bs vs the stubbed old behavior: stale-strip tail after zoom 8ms→≤1ms on the idle 3090 (the win scales
+  with strip duration — slow/contended GPUs + full-res deep frames, the reported conditions). Gates:
+  crosscheck:offscreen ALL PIXEL-IDENTICAL, 44 unit, gpu+viewer e2e green. Designed latency unchanged:
+  settle = 220ms debounce + frame; interruption = instant preview + freed GPU.
 - Spawn 32 (Danielle identified the real "blocky/glitchy fine detail" cause: render res < screen res):
   removed the mobile-era MAX_BACKING=1100 long-edge cap — the backing store now follows the TRUE canvas
   resolution (css×dpr, dpr≤2), guarded by MAX_BACKING_PIXELS=9e6 (≈4K fullscreen) + low-power's stricter

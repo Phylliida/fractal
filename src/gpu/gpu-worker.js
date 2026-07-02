@@ -60,6 +60,12 @@ self.onmessage = (e) => {
     } else if (m.type === 'cancel') {
       gen = m.gen;
       wakeAckWaiters();
+    } else if (m.type === 'sampleSn') {
+      // Runtime GPU precision self-test (Spawn 33): sample sn/iter at scattered
+      // texels of the LAST COMPLETED frame's FBO. Stale-gen requests answer null
+      // (the FBO no longer holds that frame).
+      if (m.gen !== gen || !gpu || !gpu._fbo) { post({ type: 'snSample', gen: m.gen, sn: null, iter: null }); }
+      else { const s = gpu.sampleSn(m.points); post({ type: 'snSample', gen: m.gen, sn: s.sn, iter: s.iter }); }
     } else if (m.type === 'dispose') {
       if (gpu) { try { gpu.dispose(); } catch { /* noop */ } gpu = null; }
     } else if (m.type === '__lose') {
@@ -127,6 +133,11 @@ async function runRender(plan) {
     const y0 = Math.round(y / ss), h0 = Math.round(h / ss);
     post({ type: 'strip', gen: myGen, y0, h0, bitmap }, [bitmap]);
     await waitAck(myGen);                     // back-pressure: ≤1 bitmap in flight
+    // Macrotask yield (Spawn 33): the ack that wakes us is processed BEFORE any
+    // 'cancel'/'render' message that arrived after it — without this hop the loop
+    // would synchronously submit the NEXT strip's GPU work before ever seeing the
+    // cancellation. One ~0ms timeout per strip; the gen check at the loop top bails.
+    await new Promise((r) => setTimeout(r, 0));
   }
   if (myGen !== gen) return;
   let glitches = 0;
